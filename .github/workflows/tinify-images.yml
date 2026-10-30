@@ -1,0 +1,69 @@
+name: Tinify images
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Same-repository Armenm PR number
+        required: true
+        type: string
+      dry_run:
+        description: Validate selection without uploads or writes
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: tinify-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: false
+
+jobs:
+  optimize:
+    if: >-
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) ||
+      (github.event_name == 'pull_request_target' &&
+       github.event.pull_request.user.login == 'Armenm' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.base.ref == github.event.repository.default_branch &&
+       github.event.sender.type != 'Bot')
+    runs-on: [self-hosted, macOS, ARM64, streamfc-downloads]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout immutable trusted default branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Stdlib preflight (no image dependencies or TinyPNG key)
+        id: preflight
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+        run: python3 -I tools/tinify_ci/ci.py --pr "$PR_NUMBER" --dry-run
+
+      - name: Install trusted hash-locked SDK only for eligible images
+        if: steps.preflight.outputs.candidates != '0' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+        run: |
+          SDK_ENV="$(mktemp -d "$RUNNER_TEMP/tinify-ci.XXXXXXXX")"
+          echo "SDK_ENV=$SDK_ENV" >> "$GITHUB_ENV"
+          python3 -m venv "$SDK_ENV"
+          "$SDK_ENV/bin/python" -m pip --isolated install --require-hashes --only-binary=:all: -r tools/tinify_ci/requirements.lock
+
+      - name: Optimize and require exact SHA CI approval
+        if: steps.preflight.outputs.candidates != '0' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TINYPNG_API_KEY: ${{ secrets.TINYPNG_API_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+        run: '"$SDK_ENV/bin/python" -I tools/tinify_ci/ci.py --pr "$PR_NUMBER"'
+
+      - name: Remove isolated SDK environment
+        if: always() && env.SDK_ENV != ''
+        run: rm -rf -- "$SDK_ENV"
